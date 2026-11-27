@@ -162,6 +162,23 @@ def test_qk_norm_rope_reads_norm_weight_dtype(weight_dtype):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16])
+def test_swiglu_output_dtype(out_dtype):
+    """SwiGLU emits the Humming activation dtype; fp16 avoids illegal bf16 PTX."""
+    from vllm.models.inkling2.nvidia.ops.moe_sm90 import swiglu
+
+    rows, n = 4, 128
+    input_dtype = torch.float16 if out_dtype == torch.float16 else torch.bfloat16
+    gate_up = torch.randn(rows, 2 * n, device="cuda", dtype=input_dtype)
+    weights = torch.randn(rows, device="cuda", dtype=torch.float32)
+    src2dst = torch.arange(rows, device="cuda", dtype=torch.int32)
+    out = swiglu(gate_up, weights, src2dst, 4.0, 25.0, out_dtype=out_dtype)
+    assert out.dtype == out_dtype
+    assert out.shape == (rows, n)
+    assert torch.isfinite(out).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_rmsnorm_module_follows_input_dtype():
     """With no forced out_dtype the norm writes in the model (input) dtype."""
     from vllm.models.inkling2.nvidia.model import Inkling2RMSNorm

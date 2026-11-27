@@ -60,23 +60,43 @@ def _softcap(x, CAP: tl.constexpr):
 
 
 @triton.jit
-def _situ(X, row, start, gamma, N: tl.constexpr, BLOCK: tl.constexpr, GATE_CAP, UP_CAP):
-    """fp32 values of the bf16 SiTU of columns `[start, start + BLOCK)`."""
-    # Interleaved (gate, up) bf16 pairs as one word each, loaded so that each
-    # thread holds whole 16-column blocks: column 16 * b + 4 * i + j at
-    # [i, b, j].
+def _situ(
+    X,
+    row,
+    start,
+    gamma,
+    N: tl.constexpr,
+    BLOCK: tl.constexpr,
+    GATE_CAP,
+    UP_CAP,
+    IS_FP16: tl.constexpr = False,
+):
+    """fp32 values of the SiTU of columns `[start, start + BLOCK)`, rounded
+    once to bf16 (the quantizer path) or fp16 (sm75 Humming)."""
+    # Interleaved (gate, up) pairs as one word each, loaded so that each thread
+    # holds whole 16-column blocks: column 16 * b + 4 * i + j at [i, b, j].
     i = tl.arange(0, 4)[:, None, None]
     b = tl.arange(0, BLOCK // 16)[None, :, None]
     j = tl.arange(0, 4)[None, None, :]
     cols = start + 16 * b + 4 * i + j
-    pairs = tl.load(X.to(tl.pointer_type(tl.uint32)) + row * N + cols)
-    pairs = tl.reshape(tl.permute(pairs, (1, 0, 2)), (BLOCK,))
-    gate = (pairs << 16).to(tl.float32, bitcast=True)
-    up = (pairs & 0xFFFF0000).to(tl.float32, bitcast=True)
+    if IS_FP16:
+        x16 = X.to(tl.pointer_type(tl.float16))
+        gate = tl.load(x16 + row * (2 * N) + 2 * cols)
+        up = tl.load(x16 + row * (2 * N) + 2 * cols + 1)
+        gate = tl.reshape(tl.permute(gate, (1, 0, 2)), (BLOCK,)).to(tl.float32)
+        up = tl.reshape(tl.permute(up, (1, 0, 2)), (BLOCK,)).to(tl.float32)
+    else:
+        pairs = tl.load(X.to(tl.pointer_type(tl.uint32)) + row * N + cols)
+        pairs = tl.reshape(tl.permute(pairs, (1, 0, 2)), (BLOCK,))
+        gate = (pairs << 16).to(tl.float32, bitcast=True)
+        up = (pairs & 0xFFFF0000).to(tl.float32, bitcast=True)
     sigmoid = _sigmoid_approx(gate)
     gate = _softcap(gate, GATE_CAP)
     up = _softcap(up, UP_CAP)
-    return (((gate * sigmoid) * up) * gamma).to(tl.bfloat16).to(tl.float32)
+    y = ((gate * sigmoid) * up) * gamma
+    if IS_FP16:
+        return y.to(tl.float16).to(tl.float32)
+    return y.to(tl.bfloat16).to(tl.float32)
 
 
 @triton.jit

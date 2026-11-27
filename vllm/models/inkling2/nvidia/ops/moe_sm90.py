@@ -42,9 +42,7 @@ def _humming_activation_dtype() -> torch.dtype:
     """
     vllm_config = get_current_vllm_config_or_none()
     model_dtype = (
-        vllm_config.model_config.dtype
-        if vllm_config is not None
-        else torch.bfloat16
+        vllm_config.model_config.dtype if vllm_config is not None else torch.bfloat16
     )
     if current_platform.is_device_capability(75):
         return torch.float16
@@ -150,15 +148,19 @@ def _swiglu_kernel(
     BLOCK: tl.constexpr,
     GATE_CAP: tl.constexpr,
     UP_CAP: tl.constexpr,
+    IS_FP16: tl.constexpr,
 ):
-    """bf16 softcapped SwiGLU of a local row times its routing weight."""
+    """Softcapped SwiGLU of a local row times its routing weight, stored in
+    the output dtype (fp16 on sm75, where bf16 PTX is illegal)."""
     row = tl.program_id(0)
     if tl.load(Src2Dst + row) < 0:
         return
     start = tl.program_id(1) * BLOCK
     gamma = tl.load(Weights + row)
-    values = _situ(GateUp, row, start, gamma, N, BLOCK, GATE_CAP, UP_CAP)
-    tl.store(Out + row * N + start + tl.arange(0, BLOCK), values.to(tl.bfloat16))
+    values = _situ(GateUp, row, start, gamma, N, BLOCK, GATE_CAP, UP_CAP, IS_FP16)
+    tl.store(
+        Out + row * N + start + tl.arange(0, BLOCK), values.to(Out.dtype.element_ty)
+    )
 
 
 def swiglu(
@@ -167,14 +169,16 @@ def swiglu(
     src2dst: torch.Tensor,
     gate_cap: float,
     up_cap: float,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """`activation.swiglu_quantize`'s SiTU of the interleaved (gate, up)
-    columns times the routing weights, in bf16, for the local rows (the
-    others are left unset)."""
+    columns times the routing weights, in `out_dtype` (bf16 by default),
+    for the local rows (the others are left unset)."""
     rows, n = gate_up.shape[0], gate_up.shape[1] // 2
     block = 256 if n % 256 == 0 else 128
     assert n % block == 0
-    out = torch.empty((rows, n), dtype=torch.bfloat16, device=gate_up.device)
+    dtype = out_dtype or torch.bfloat16
+    out = torch.empty((rows, n), dtype=dtype, device=gate_up.device)
     _swiglu_kernel[(rows, n // block)](
         gate_up,
         weights,
@@ -184,6 +188,7 @@ def swiglu(
         BLOCK=block,
         GATE_CAP=gate_cap,
         UP_CAP=up_cap,
+        IS_FP16=(dtype == torch.float16),
         num_warps=2,
     )
     return out
@@ -346,7 +351,9 @@ class HummingExperts:
         gate_up = self._gemm(
             "w13", x, rows, alignments[block_m["w13"]], topk, valid_rows
         )
-        activated = swiglu(gate_up, weights, src2dst, gate_cap, up_cap)
+        activated = swiglu(
+            gate_up, weights, src2dst, gate_cap, up_cap, out_dtype=self.dtype
+        )
         del gate_up
         return self._gemm(
             "w2", activated, rows, alignments[block_m["w2"]], 1, valid_rows

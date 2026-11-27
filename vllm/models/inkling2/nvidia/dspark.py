@@ -57,9 +57,24 @@ class _RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size), requires_grad=False)
         self.eps = eps
 
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        xf = x.float()
+        normed = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.eps)
+        return (normed * self.weight.float()).to(x.dtype)
+
     def forward(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> torch.Tensor:
+        if current_platform.is_device_capability(75):
+            # Turing (sm75) has no libcuda stub on some hosts, so any
+            # flashinfer JIT module fails to link; use a pure-PyTorch fp32
+            # fallback that matches flashinfer's numerics.
+            if residual is None:
+                return self._norm(x)
+            # In place: residual += x (input dtype); x = norm(residual).
+            residual.add_(x)
+            x.copy_(self._norm(residual))
+            return x
         from flashinfer.norm import fused_add_rmsnorm, rmsnorm
 
         if residual is None:
@@ -76,8 +91,8 @@ def all_reduce_add_rmsnorm(
 
     Batches that the TP group's FlashInfer MNNVL all-reduce takes run its
     fused all-reduce + residual add + RMSNorm on the same workspace (the
-    same rank-order fp32 sum, rounded once to bf16); the norm then reads the
-    bf16 residual. Others all-reduce, then add and normalize.
+    same rank-order fp32 sum, rounded once to the model dtype); the norm
+    then reads that residual. Others all-reduce, then add and normalize.
     """
     fi_ar = getattr(get_tp_group().device_communicator, "fi_ar_comm", None)
     capability = current_platform.get_device_capability()
@@ -552,7 +567,7 @@ class Inkling2DSparkModel(nn.Module):
         return self.model(input_ids, positions)
 
     def compute_base_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """TP-local bf16 base logits (bf16 GEMM, as the reference)."""
+        """TP-local base logits in the model dtype (fp16 under --dtype half)."""
         assert self.lm_head is not None
         return linear(hidden_states, self.lm_head.weight)
 

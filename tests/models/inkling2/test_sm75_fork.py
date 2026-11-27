@@ -268,3 +268,80 @@ def test_loop_norms_honor_out_dtype(out_dtype):
         dest, message, gain_forget, norm_weight, 1e-6, out_dtype=out_dtype
     )
     assert blend.dtype == out_dtype
+
+
+def _ref_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    xf = x.float()
+    normed = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)
+    return (normed * weight.float()).to(x.dtype)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_dspark_rmsnorm_fp32_fallback_on_sm75(monkeypatch, dtype):
+    """On sm75 `_RMSNorm` matches an fp32 reference, in the input dtype.
+
+    The fallback computes in fp32 and casts once, so the result is exact
+    against a reference that does the same; the residual path updates the
+    residual in place (input dtype) and writes the norm back into `x`.
+    """
+    from vllm.models.inkling2.nvidia.dspark import _RMSNorm
+
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda capability: capability == 75
+    )
+    torch.manual_seed(851)
+    hidden, eps = 128, 1e-6
+    norm = _RMSNorm(hidden, eps)
+    with torch.no_grad():
+        norm.weight.copy_(0.5 + torch.rand(hidden))
+    weight = norm.weight.detach().clone()
+
+    atol, rtol = (0.0, 0.0) if dtype == torch.float32 else (1e-3, 1e-3)
+
+    x = torch.randn(7, hidden, dtype=dtype)
+    out = norm(x)
+    assert out.dtype == dtype
+    torch.testing.assert_close(out, _ref_rmsnorm(x, weight, eps), atol=atol, rtol=rtol)
+
+    x = torch.randn(7, hidden, dtype=dtype)
+    residual = torch.randn(7, hidden, dtype=dtype)
+    x_orig, residual_orig = x.clone(), residual.clone()
+    out = norm(x, residual)
+    assert out is x and out.dtype == dtype
+    torch.testing.assert_close(residual, residual_orig + x_orig, atol=atol, rtol=rtol)
+    torch.testing.assert_close(
+        out, _ref_rmsnorm(residual_orig + x_orig, weight, eps), atol=atol, rtol=rtol
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_dspark_rmsnorm_selects_fallback_on_sm75(monkeypatch):
+    """sm75 takes the pure-PyTorch path; other capabilities use flashinfer."""
+    from vllm.models.inkling2.nvidia.dspark import _RMSNorm
+
+    norm = _RMSNorm(16, 1e-6)
+    x = torch.randn(4, 16, dtype=torch.float32)
+
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda capability: capability == 75
+    )
+    # The fallback runs without importing flashinfer.
+    assert norm(x).dtype == x.dtype
+
+    fi_norm = pytest.importorskip("flashinfer.norm")
+    used: list[str] = []
+    monkeypatch.setattr(
+        fi_norm, "rmsnorm", lambda x, w, eps: used.append("rmsnorm") or x
+    )
+    monkeypatch.setattr(
+        fi_norm,
+        "fused_add_rmsnorm",
+        lambda *args, **kwargs: used.append("fused_add"),
+    )
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda capability: False
+    )
+    norm(x)
+    norm(x, torch.zeros_like(x))
+    assert used == ["rmsnorm", "fused_add"]

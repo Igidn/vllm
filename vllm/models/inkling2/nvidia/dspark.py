@@ -589,9 +589,9 @@ class Inkling2DSparkModel(nn.Module):
                     name, shard = name.replace(old, new), shard_id
                     break
             param = params[name]
-            if weight.dtype != param.dtype:
-                # Checkpoints are bf16; with --dtype half the params are fp16.
-                param.data.copy_(weight)
+            # Checkpoints are bf16; with --dtype half the params are fp16. The
+            # loaders convert dtype on the shard they own: copying the full
+            # checkpoint tensor here would fail for the stacked weights above.
             if shard is None:
                 getattr(param, "weight_loader", default_weight_loader)(param, weight)
             else:

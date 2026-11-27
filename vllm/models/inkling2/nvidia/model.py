@@ -785,16 +785,19 @@ class Inkling2ForConditionalGeneration(
                     continue
                 raise ValueError(f"Unexpected checkpoint tensor: {name}")
             param = params[name]
-            if param.dtype != weight.dtype:
-                if ".mlp.experts." in name and weight.dtype == torch.bfloat16:
-                    raise ValueError(
-                        f"{name}: BF16 expert weights are not supported; the "
-                        "Inkling2 experts are NVFP4 / MXFP8, as declared per "
-                        "tensor in the checkpoint's hf_quant_config.json"
-                    )
-                # Checkpoints are bf16; with --dtype half the params are fp16.
-                # Expert weights stay packed and keep their checkpoint dtype.
-                param.data.copy_(weight)
+            if (
+                param.dtype != weight.dtype
+                and ".mlp.experts." in name
+                and weight.dtype == torch.bfloat16
+            ):
+                raise ValueError(
+                    f"{name}: BF16 expert weights are not supported; the "
+                    "Inkling2 experts are NVFP4 / MXFP8, as declared per "
+                    "tensor in the checkpoint's hf_quant_config.json"
+                )
+            # Checkpoints are bf16; with --dtype half the params are fp16. The
+            # loaders convert dtype on the shard they own: copying the full
+            # checkpoint tensor here would fail for the fused weights above.
             loader: Callable[..., None] = getattr(
                 param, "weight_loader", default_weight_loader
             )

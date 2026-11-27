@@ -108,3 +108,40 @@ def test_qk_norm_rope_reads_norm_weight_dtype(weight_dtype):
         eps,
     )
     torch.testing.assert_close(qkv, expected, atol=1e-3, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_rmsnorm_module_follows_input_dtype():
+    """With no forced out_dtype the norm writes in the model (input) dtype."""
+    from vllm.models.inkling2.nvidia.model import Inkling2RMSNorm
+
+    norm = Inkling2RMSNorm(128, 1e-6)
+    assert norm.out_dtype is None
+    x = torch.randn(7, 128, device="cuda", dtype=torch.float16)
+    out = norm(x)
+    assert out.dtype == torch.float16
+    ref = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
+    torch.testing.assert_close(out, ref.to(torch.float16), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16])
+def test_loop_norms_honor_out_dtype(out_dtype):
+    """The loop pair/blend norms write in the dtype the controller GEMMs use."""
+    from vllm.models.inkling2.nvidia.ops.loop import blend_rms_norm, pair_rms_norm
+
+    streams, tokens, width = 2, 5, 64
+    device = "cuda"
+    dest = torch.randn(streams, tokens, width, device=device, dtype=torch.float32)
+    message = torch.randn(streams, tokens, width, device=device, dtype=torch.float32)
+    gain_forget = torch.randn(
+        streams, tokens, 2 * width, device=device, dtype=torch.float32
+    )
+    norm_weight = torch.ones(streams, width, device=device, dtype=torch.float32)
+
+    pair = pair_rms_norm(dest, message, out_dtype=out_dtype)
+    assert pair.dtype == out_dtype
+    blend = blend_rms_norm(
+        dest, message, gain_forget, norm_weight, 1e-6, out_dtype=out_dtype
+    )
+    assert blend.dtype == out_dtype

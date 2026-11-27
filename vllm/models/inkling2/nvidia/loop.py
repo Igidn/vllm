@@ -17,6 +17,7 @@ from collections.abc import Sequence
 import torch
 from torch import nn
 
+from vllm.config import get_current_vllm_config
 from vllm.distributed import tensor_model_parallel_all_reduce
 
 from ..configs import Inkling2ModelConfig
@@ -57,8 +58,9 @@ class Inkling2MessageController(nn.Module):
         """fp32 `(T, D)` `dest` and `message` -> fp32 `(T, D)`."""
         pair = torch.stack((dest, message), dim=1)
         pair = pair * torch.rsqrt(pair.square().mean(-1, keepdim=True) + 1e-6)
-        normalized = pair.to(torch.bfloat16).flatten(1)
-        hidden = linear_k_groups(normalized, self.down_weight, torch.bfloat16)
+        dtype = self.down_weight.dtype
+        normalized = pair.to(dtype).flatten(1)
+        hidden = linear_k_groups(normalized, self.down_weight, dtype)
         gain = torch.mm(hidden, self.gain_weight.t(), out_dtype=torch.float32)
         forget = torch.mm(hidden, self.forget_weight.t(), out_dtype=torch.float32)
         return (1.0 - torch.tanh(forget)) * dest + torch.tanh(gain) * message
@@ -81,15 +83,16 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
         assert config.loop_config is not None
         rank, width = config.loop_config["gate_rank"], config.hidden_size
         streams = len(LOOP_STREAMS)
-        # down (S, r, 2D) and [gain; forget] (S, 2D, r), bf16.
+        # down (S, r, 2D) and [gain; forget] (S, 2D, r), model dtype.
+        dtype = get_current_vllm_config().model_config.dtype
         self.register_buffer(
             "controller_down",
-            torch.empty(streams, rank, 2 * width, dtype=torch.bfloat16),
+            torch.empty(streams, rank, 2 * width, dtype=dtype),
             persistent=False,
         )
         self.register_buffer(
             "controller_gain_forget",
-            torch.empty(streams, 2 * width, rank, dtype=torch.bfloat16),
+            torch.empty(streams, 2 * width, rank, dtype=dtype),
             persistent=False,
         )
         self.controllers = nn.ModuleDict(
@@ -120,17 +123,19 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
     ) -> torch.Tensor:
         """The `streams` controllers on fp32 `(S, T, D)` `dest` (may
         broadcast over streams) and `message`, each output RMS-normalized
-        with its row of `norm_weight` `(S, D)`: bf16 `(S, T, D)`."""
-        pair = pair_rms_norm(dest, message)
+        with its row of `norm_weight` `(S, D)`: model-dtype `(S, T, D)`."""
         down = self.controller_down[streams]
         up = self.controller_gain_forget[streams]
+        pair = pair_rms_norm(dest, message, out_dtype=down.dtype)
         if use_sm12x_bf16_ll_gemm(pair, down):
             hidden = sm12x_bf16_ll_gemm(pair, down)
             gain_forget = sm12x_bf16_ll_gemm(hidden, up, out_dtype=torch.float32)
         else:
             hidden = torch.bmm(pair, down.transpose(1, 2))
             gain_forget = torch.bmm(hidden, up.transpose(1, 2), out_dtype=torch.float32)
-        return blend_rms_norm(dest, message, gain_forget, norm_weight, norm_eps)
+        return blend_rms_norm(
+            dest, message, gain_forget, norm_weight, norm_eps, out_dtype=down.dtype
+        )
 
 
 class Inkling2LoopModel(Inkling2Model):

@@ -73,8 +73,14 @@ class Inkling2Gate(nn.Module):
         num_experts, hidden = config.n_routed_experts, config.hidden_size
         self.topk = config.num_experts_per_tok
         self.route_scale = config.route_scale
+        vllm_config = get_current_vllm_config_or_none()
+        dtype = (
+            vllm_config.model_config.dtype
+            if vllm_config is not None
+            else torch.bfloat16
+        )
         self.weight = nn.Parameter(
-            torch.empty(num_experts, hidden, dtype=torch.bfloat16),
+            torch.empty(num_experts, hidden, dtype=dtype),
             requires_grad=False,
         )
         self.bias = nn.Parameter(
@@ -347,7 +353,12 @@ class Inkling2MoE(nn.Module):
         selection of the routing kernels (`select_experts`, `route`)."""
         gate = self.gate
         ids, _, _ = select_experts(
-            x, gate.weight, gate.bias, gate.topk, gate.route_scale, self.all_experts
+            x.to(gate.weight.dtype),
+            gate.weight,
+            gate.bias,
+            gate.topk,
+            gate.route_scale,
+            self.all_experts,
         )
         return ids
 
@@ -359,7 +370,7 @@ class Inkling2MoE(nn.Module):
         lora: ExpertsLoRA | None = None,
         pass_idx: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
-        """bf16 [T, H] -> bf16 [T, H], reduced over the expert-parallel group;
+        """`[T, H]` in the model dtype -> same dtype, reduced over the expert group;
         without `reduce`, the unreduced `(down, src2dst)` of
         `Inkling2Experts`, or (with `push`) pushes this rank's partial sums
         to the token shard owners.
@@ -383,6 +394,9 @@ class Inkling2MoE(nn.Module):
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
             is_padding = get_forward_context().is_padding
         if not (experts.sm100 or experts.sm120):
+            # Humming on sm75 rejects bf16 activations; the gate weight tracks
+            # the model dtype, so --dtype half feeds fp16 to both GEMMs.
+            x = x.to(gate.weight.dtype)
             selected = select_experts(
                 x,
                 gate.weight,

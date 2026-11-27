@@ -109,7 +109,7 @@ class Inkling2RMSNorm(nn.Module):
         self,
         hidden_size: int,
         eps: float,
-        out_dtype: torch.dtype | None = torch.bfloat16,
+        out_dtype: torch.dtype | None = None,
         num_inputs: int = 1,
     ) -> None:
         super().__init__()

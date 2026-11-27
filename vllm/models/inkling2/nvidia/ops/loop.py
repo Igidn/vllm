@@ -3,7 +3,7 @@
 """Loop message controllers, batched over streams.
 
 A controller blends a fp32 message into a fp32 sublayer input `dest`: from
-`h = down(rms([dest, message]))` (bf16), `out = (1 - tanh(forget(h))) * dest +
+`h = down(rms([dest, message]))` (model dtype), `out = (1 - tanh(forget(h))) * dest +
 tanh(gain(h)) * message` in fp32, unfused as the reference. The output feeds
 the sublayer's RMSNorm, applied in the same kernel.
 """
@@ -39,14 +39,19 @@ def _pair_rms_norm_kernel(
     tl.store(out + D + cols, (message * message_rstd).to(Out.dtype.element_ty), mask)
 
 
-def pair_rms_norm(dest: torch.Tensor, message: torch.Tensor) -> torch.Tensor:
-    """bf16 `(S, T, 2D)` `[rms(dest), rms(message)]` of fp32 `(S, T, D)`
-    inputs, weightless; `dest` may broadcast over streams (stride 0)."""
+def pair_rms_norm(
+    dest: torch.Tensor, message: torch.Tensor, out_dtype: torch.dtype | None = None
+) -> torch.Tensor:
+    """`(S, T, 2D)` `[rms(dest), rms(message)]` of fp32 `(S, T, D)` inputs,
+    weightless; `dest` may broadcast over streams (stride 0). `out_dtype`
+    follows the model dtype; bf16 is kept as the default."""
     num_streams, num_tokens, d = message.shape
     assert dest.shape == message.shape and message.is_contiguous()
     assert dest.stride(1) == d and dest.stride(2) == 1
     assert dest.dtype == message.dtype == torch.float32
-    out = message.new_empty((num_streams, num_tokens, 2 * d), dtype=torch.bfloat16)
+    out = message.new_empty(
+        (num_streams, num_tokens, 2 * d), dtype=out_dtype or torch.bfloat16
+    )
     if num_tokens:
         _pair_rms_norm_kernel[(num_streams, num_tokens)](
             dest,
@@ -100,8 +105,9 @@ def blend_rms_norm(
     gain_forget: torch.Tensor,
     norm_weight: torch.Tensor,
     norm_eps: float,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """bf16 `(S, T, D)` RMSNorm (row `s` of `norm_weight` `(S, D)`) of
+    """`(S, T, D)` RMSNorm (row `s` of `norm_weight` `(S, D)`) of
     `(1 - tanh(forget)) * dest + tanh(gain) * message`, with fp32 `(S, T, D)`
     `dest` (may broadcast over streams) and `message`, and fp32 `(S, T, 2D)`
     `gain_forget` = `[gain, forget]`. `norm_weight` may broadcast too."""
@@ -111,7 +117,9 @@ def blend_rms_norm(
     assert gain_forget.shape == (num_streams, num_tokens, 2 * d)
     assert gain_forget.is_contiguous() and gain_forget.dtype == torch.float32
     assert norm_weight.shape == (num_streams, d) and norm_weight.stride(1) == 1
-    out = message.new_empty((num_streams, num_tokens, d), dtype=torch.bfloat16)
+    out = message.new_empty(
+        (num_streams, num_tokens, d), dtype=out_dtype or torch.bfloat16
+    )
     if num_tokens:
         _blend_rms_norm_kernel[(num_streams, num_tokens)](
             dest,

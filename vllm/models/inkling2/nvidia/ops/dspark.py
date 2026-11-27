@@ -65,6 +65,15 @@ def mix_rmsnorm(
 
 
 @triton.jit
+def _round_bf16(x):
+    # fp32 -> bf16 -> fp32 (round to nearest even) on the bits: the compiler
+    # folds an extf(truncf(x)) pair, and with it fuses mul + add into an FMA.
+    bits = x.to(tl.uint32, bitcast=True)
+    bits = (bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000
+    return bits.to(tl.float32, bitcast=True)
+
+
+@triton.jit
 def _qk_norm_rope_kernel(
     X,
     Q_WEIGHT,
@@ -102,15 +111,15 @@ def _qk_norm_rope_kernel(
         w2 = tl.load(w_ptr + HALF + half_ar).to(tl.float32)
         x1 = tl.load(row + half_ar).to(tl.float32) * inv * w1
         x2 = tl.load(row + HALF + half_ar).to(tl.float32) * inv * w2
-        x1 = x1.to(tl.bfloat16).to(tl.float32)
-        x2 = x2.to(tl.bfloat16).to(tl.float32)
+        x1 = _round_bf16(x1)
+        x2 = _round_bf16(x2)
     else:
         x1 = tl.load(row + half_ar).to(tl.float32)
         x2 = tl.load(row + HALF + half_ar).to(tl.float32)
     o1 = x1 * cos - x2 * sin
     o2 = x2 * cos + x1 * sin
-    tl.store(row + half_ar, o1.to(tl.bfloat16))
-    tl.store(row + HALF + half_ar, o2.to(tl.bfloat16))
+    tl.store(row + half_ar, _round_bf16(o1).to(X.dtype.element_ty))
+    tl.store(row + HALF + half_ar, _round_bf16(o2).to(X.dtype.element_ty))
 
 
 def qk_norm_rope_(
@@ -192,15 +201,16 @@ def _add_softcap_kernel(A, B, OUT, stride_a, stride_b, softcap, N, BLOCK: tl.con
     mask = cols < N
     a = tl.load(A + row * stride_a + cols, mask, other=0).to(tl.float32)
     b = tl.load(B + row * stride_b + cols, mask, other=0).to(tl.float32)
-    x = (a + b).to(tl.bfloat16)
+    x = _round_bf16(a + b)
     x = x / softcap
     x = tldevice.tanh(x)
     x = x * softcap
-    tl.store(OUT + row * N + cols, x.to(tl.bfloat16), mask)
+    tl.store(OUT + row * N + cols, _round_bf16(x).to(OUT.dtype.element_ty), mask)
 
 
 def add_softcap(a: torch.Tensor, b: torch.Tensor, softcap: float) -> torch.Tensor:
-    """bf16 `softcap * tanh(bf16(a + b) / softcap)` of two bf16 2D tensors."""
+    """`softcap * tanh(bf16(a + b) / softcap)` of two 2D tensors, rounding the
+    sum to bf16 precision (in fp32, so no bf16 PTX is emitted)."""
     rows, n = a.shape
     assert a.stride(1) == 1 and b.stride(1) == 1
     out = a.new_empty((rows, n))
@@ -209,15 +219,6 @@ def add_softcap(a: torch.Tensor, b: torch.Tensor, softcap: float) -> torch.Tenso
             a, b, out, a.stride(0), b.stride(0), softcap, n, 1024
         )
     return out
-
-
-@triton.jit
-def _round_bf16(x):
-    # fp32 -> bf16 -> fp32 (round to nearest even) on the bits: the compiler
-    # folds an extf(truncf(x)) pair, and with it fuses mul + add into an FMA.
-    bits = x.to(tl.uint32, bitcast=True)
-    bits = (bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000
-    return bits.to(tl.float32, bitcast=True)
 
 
 @triton.jit
@@ -235,8 +236,11 @@ def _markov_gate_kernel(RAW, STATE, OUT, LATENT, RANK: tl.constexpr):
     cand = _round_bf16(tldevice.tanh(cand))
     keep = _round_bf16(gate * state)
     update = _round_bf16(_round_bf16(1.0 - gate) * cand)
-    tl.store(OUT + row * RANK + c, (keep + update).to(tl.bfloat16))
-    tl.store(LATENT + row * RANK + c, tldevice.tanh(out).to(tl.bfloat16))
+    tl.store(OUT + row * RANK + c, _round_bf16(keep + update).to(OUT.dtype.element_ty))
+    tl.store(
+        LATENT + row * RANK + c,
+        _round_bf16(tldevice.tanh(out)).to(LATENT.dtype.element_ty),
+    )
 
 
 def markov_gate(

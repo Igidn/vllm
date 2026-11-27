@@ -40,13 +40,18 @@ _TARGET: dict = {
 }
 
 
-@pytest.mark.parametrize("dtype", ["float16", "bfloat16", None])
+@pytest.mark.parametrize(
+    "dtype", ["float16", "bfloat16", None, torch.float16, torch.bfloat16]
+)
 def test_dspark_config_follows_target_dtype(dtype):
     """The draft spec inherits the target dtype instead of forcing bf16."""
     overrides = {} if dtype is None else {"dtype": dtype}
     config = Inkling2MMConfig(**_TARGET, **overrides)
     draft = Inkling2DSparkConfig.from_target(config)
-    assert draft.dtype == (getattr(torch, dtype) if dtype else torch.bfloat16)
+    expected = torch.bfloat16
+    if dtype is not None:
+        expected = getattr(torch, str(dtype).removeprefix("torch."))
+    assert draft.dtype == expected
 
 
 def test_quant_config_accepts_fp16_on_sm75():
@@ -107,7 +112,7 @@ def test_humming_input_schema_is_fp16_only_on_sm75(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_qk_norm_rope_reads_norm_weight_dtype(weight_dtype):
     """QK norm reads weights at their real dtype, not a hardcoded bf16 pointer.
 
@@ -159,6 +164,56 @@ def test_qk_norm_rope_reads_norm_weight_dtype(weight_dtype):
         eps,
     )
     torch.testing.assert_close(qkv, expected, atol=1e-3, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_add_softcap_rounds_sum_to_bf16(dtype):
+    """The softcap sum rounds to bf16 precision without bf16 PTX (sm75)."""
+    from vllm.models.inkling2.nvidia.ops.dspark import add_softcap
+
+    torch.manual_seed(851)
+    rows, n, softcap = 5, 257, 30.0
+    a = torch.randn(rows, n, device="cuda", dtype=dtype) * 4
+    b = torch.randn(rows, n, device="cuda", dtype=dtype) * 4
+
+    out = add_softcap(a, b, softcap)
+    ref = (a.float() + b.float()).bfloat16().float() / softcap
+    ref = (torch.tanh(ref) * softcap).bfloat16().to(dtype)
+
+    assert out.dtype == dtype
+    # The reference output is bf16-quantized, so only bf16 precision is exact.
+    torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_markov_gate_rounds_each_step_to_bf16(dtype):
+    """The Markov head rounds every step to bf16 like the reference, in fp16."""
+    from vllm.models.inkling2.nvidia.ops.dspark import markov_gate
+
+    torch.manual_seed(852)
+    rows, rank = 4, 256
+    raw = torch.randn(rows, 3 * rank, device="cuda", dtype=torch.float32)
+    state = torch.randn(rows, rank, device="cuda", dtype=dtype)
+
+    out, latent = markov_gate(raw, state)
+
+    def rbf16(x):
+        return x.bfloat16().float()
+
+    raw_r = rbf16(raw)
+    gate = rbf16(torch.sigmoid(raw_r[:, :rank]))
+    cand = rbf16(torch.tanh(raw_r[:, rank : 2 * rank]))
+    out_r = rbf16(torch.tanh(raw_r[:, 2 * rank :]))
+    keep = rbf16(gate * state.float())
+    update = rbf16(rbf16(1.0 - gate) * cand)
+    ref_out = rbf16(keep + update).to(dtype)
+    ref_latent = rbf16(torch.tanh(out_r)).to(dtype)
+
+    assert out.dtype == latent.dtype == dtype
+    torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=0)
+    torch.testing.assert_close(latent, ref_latent, atol=1e-2, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

@@ -1,22 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inkling2 routed experts on Hopper/Turing: Humming expert GEMMs (fp16
-activations, NVFP4 / MXFP8 weights) in place of the TRT-LLM-gen ones.
+activations on sm75, model dtype elsewhere, NVFP4 / MXFP8 weights) in place
+of the TRT-LLM-gen ones.
 
 Rows stay in the flat (token * topk + slot) order: the gate/up GEMM
 gathers each row's token, the down GEMM reads and writes row by row, and
 `ops.moe.combine` sums them with the identity `src2dst` (-1: not local).
 """
 
+import dataclasses
 import json
 from typing import TYPE_CHECKING
 
 import torch
 
 import vllm.envs as envs
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .activation import _situ
@@ -28,6 +32,34 @@ if TYPE_CHECKING:
 
 # Row block size when no Humming tuning range covers the row count.
 _DEFAULT_BLOCK_M = 64
+
+
+def _humming_activation_dtype() -> torch.dtype:
+    """Dtype of the Humming expert GEMMs' inputs and outputs.
+
+    Sm75Heuristics allows only fp16 activations; elsewhere follow the model
+    dtype so Hopper/Blackwell keep their original bf16 numerics.
+    """
+    vllm_config = get_current_vllm_config_or_none()
+    model_dtype = (
+        vllm_config.model_config.dtype
+        if vllm_config is not None
+        else torch.bfloat16
+    )
+    if current_platform.is_device_capability(75):
+        return torch.float16
+    return model_dtype
+
+
+def _normalize_input_schema(input_schema: "HummingInputSchema | None"):
+    """Give Humming an fp16 activation contract on sm75, even if the caller
+    supplied a schema; elsewhere keep the caller's or Humming's default."""
+    from vllm.utils.humming import HummingInputSchema, dtypes
+
+    schema = input_schema or HummingInputSchema()
+    if current_platform.is_device_capability(75):
+        return dataclasses.replace(schema, a_dtype=dtypes.float16)
+    return schema
 
 
 @triton.jit
@@ -166,7 +198,8 @@ class HummingExperts:
             and, for NVFP4, the per-expert global scales `[E]` (else None).
         shapes: `(N, K)` of each projection.
         nvfp4: NVFP4 (else MXFP8) weights.
-        input_schema: Quantized input contract, or None for FP16 activations.
+        input_schema: Quantized input contract, or None for model-dtype
+            activations (fp16 on sm75).
 
     """
 
@@ -179,13 +212,14 @@ class HummingExperts:
     ) -> None:
         from vllm.utils.humming import (
             GemmType,
-            HummingInputSchema,
             ModeloptMxfp8WeightSchema,
             ModeloptNvfp4WeightSchema,
-            dtypes,
             get_heuristics_config,
             prepare_and_transform_humming_tensors,
         )
+
+        self.dtype = _humming_activation_dtype()
+        input_schema = _normalize_input_schema(input_schema)
 
         self.configs = {}
         self.tensors: dict[str, dict[str, torch.Tensor]] = {}
@@ -204,7 +238,7 @@ class HummingExperts:
                 tensors=tensors,
                 shape_n_stacks=[n],
                 shape_k_stacks=[k],
-                param_dtype=torch.float16,
+                param_dtype=self.dtype,
                 num_experts=num_experts,
             )
             config, tensors = prepare_and_transform_humming_tensors(
@@ -213,10 +247,10 @@ class HummingExperts:
                 shape_k=k,
                 pad_n_to_multiple=256,
                 pad_k_to_multiple=128,
-                input_schema=input_schema or HummingInputSchema(a_dtype=dtypes.float16),
+                input_schema=input_schema,
                 weight_schema=schema,
                 num_experts=num_experts,
-                torch_dtype=torch.float16,
+                torch_dtype=self.dtype,
                 device=weight.device,
             )
             assert config.shape_n == n and config.shape_k == k, (n, k)
@@ -261,12 +295,12 @@ class HummingExperts:
     ) -> torch.Tensor:
         from vllm.utils.humming import humming_forward
 
-        # SwiGLU emits bf16; Humming on sm75 only accepts fp16 activations.
-        inputs = inputs.to(torch.float16)
+        # SwiGLU emits bf16; sm75 Humming accepts fp16 activations only.
+        inputs = inputs.to(self.dtype)
         config = self.configs[name]
         tensors = self.tensors[name]
         out = torch.empty(
-            (rows, config.shape_n), dtype=torch.float16, device=inputs.device
+            (rows, config.shape_n), dtype=self.dtype, device=inputs.device
         )
         sorted_ids, expert_ids, num_tokens_padded = alignment
         return humming_forward(
@@ -296,8 +330,8 @@ class HummingExperts:
         gate_cap: float,
         up_cap: float,
     ) -> torch.Tensor:
-        """fp16 `[T * topk, H]` down-projection rows of the local slots of
-        `ids` (`select_experts`); the other rows are left unset."""
+        """`[T * topk, H]` down-projection rows of the local slots of `ids`
+        (`select_experts`) in `self.dtype`; the other rows are left unset."""
         tokens, topk = ids.shape
         rows = tokens * topk
         # Expected local rows, which pick the kernel configs.

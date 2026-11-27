@@ -17,7 +17,7 @@ from collections.abc import Sequence
 import torch
 from torch import nn
 
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import tensor_model_parallel_all_reduce
 
 from ..configs import Inkling2ModelConfig
@@ -84,7 +84,12 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
         rank, width = config.loop_config["gate_rank"], config.hidden_size
         streams = len(LOOP_STREAMS)
         # down (S, r, 2D) and [gain; forget] (S, 2D, r), model dtype.
-        dtype = get_current_vllm_config().model_config.dtype
+        vllm_config = get_current_vllm_config_or_none()
+        dtype = (
+            vllm_config.model_config.dtype
+            if vllm_config is not None
+            else torch.bfloat16
+        )
         self.register_buffer(
             "controller_down",
             torch.empty(streams, rank, 2 * width, dtype=dtype),

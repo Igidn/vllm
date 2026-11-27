@@ -18,6 +18,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.models.inkling2.configs import INKLING2_ARCHITECTURES
+from vllm.platforms import current_platform
 
 _COMPUTE_DTYPES = ("float32", "bfloat16", "mxfp8", "nvfp4")
 
@@ -39,6 +40,10 @@ class Inkling2QuantConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+        # Turing has no bf16 tensor cores: Humming's sm75 heuristics reject
+        # bf16 activations, so --dtype bfloat16 cannot serve the MoE GEMMs.
+        if current_platform.is_device_capability(75):
+            return [torch.float16]
         return [torch.bfloat16, torch.float16]
 
     @classmethod

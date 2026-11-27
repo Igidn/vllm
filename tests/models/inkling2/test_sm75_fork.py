@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""sm75 fork boundaries: config guards and the DSpark QK-norm pointer dtype."""
+"""sm75 fork boundaries: config guards, dtype boundaries and DSpark norm."""
 
 import pytest
 import torch
 
 from vllm.models.inkling2.configs import Inkling2DSparkConfig, Inkling2MMConfig
 from vllm.models.inkling2.quant_config import Inkling2QuantConfig
+from vllm.platforms import current_platform
 
 _TARGET: dict = {
     "architectures": ["Inkling2ForConditionalGeneration"],
@@ -53,6 +54,56 @@ def test_quant_config_accepts_fp16_on_sm75():
     quant = Inkling2QuantConfig({"model": {"parameter_groups": []}})
     assert torch.float16 in quant.get_supported_act_dtypes()
     assert quant.get_min_capability() == 75
+
+
+def test_quant_config_rejects_bf16_on_sm75(monkeypatch):
+    """Config validation must reject bf16 before the MoE GEMMs reach Turing."""
+    quant = Inkling2QuantConfig({"model": {"parameter_groups": []}})
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda capability: capability == 75
+    )
+    assert quant.get_supported_act_dtypes() == [torch.float16]
+
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda capability: False
+    )
+    assert quant.get_supported_act_dtypes() == [torch.bfloat16, torch.float16]
+
+
+def test_humming_dtype_is_fp16_only_on_sm75(monkeypatch, default_vllm_config):
+    """Humming keeps bf16 off sm75 but follows the model dtype elsewhere."""
+    from vllm.models.inkling2.nvidia.ops.moe_sm90 import _humming_activation_dtype
+
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda capability: capability == 75
+    )
+    assert _humming_activation_dtype() == torch.float16
+
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda capability: False
+    )
+    assert _humming_activation_dtype() == default_vllm_config.model_config.dtype
+
+
+def test_humming_input_schema_is_fp16_only_on_sm75(monkeypatch):
+    """A caller-supplied schema cannot reintroduce bf16 activations on sm75."""
+    pytest.importorskip("humming")
+    from vllm.models.inkling2.nvidia.ops.moe_sm90 import _normalize_input_schema
+    from vllm.utils.humming import HummingInputSchema, dtypes
+
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda capability: capability == 75
+    )
+    assert _normalize_input_schema(HummingInputSchema()).a_dtype == dtypes.float16
+    assert (
+        _normalize_input_schema(HummingInputSchema(a_dtype=dtypes.bfloat16)).a_dtype
+        == dtypes.float16
+    )
+
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda capability: False
+    )
+    assert _normalize_input_schema(HummingInputSchema()).a_dtype is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

@@ -289,6 +289,9 @@ def rel_attention(
     if lse is None:
         lse = out
     block_m = _block_m(max_query_len, group)
+    if current_platform.is_device_capability(75):
+        # A 128-row query tile needs 96 KiB of shared memory on Turing.
+        block_m = min(block_m, 32)
     tokens_per_tile = block_m // group
     num_reqs = cache_seqlens.shape[0]
     grid = (

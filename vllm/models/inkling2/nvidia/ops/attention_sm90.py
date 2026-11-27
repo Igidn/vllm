@@ -16,6 +16,7 @@ holds for every replay of a CUDA graph.
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 # The query tile of tml_fa4 that shears the relative logits.
@@ -339,5 +340,7 @@ def rel_attention(
         BLOCK_M=block_m,
         BLOCK_N=64 if block_m >= 128 else 128 if block_m <= 32 else 64,
         num_warps=8 if block_m >= 128 else 4,
-        num_stages=2,
+        # Turing has 64 KiB of shared memory per block; two stages of the
+        # largest KV tile need 72 KiB. Pipelining does not affect the math.
+        num_stages=1 if current_platform.is_device_capability(75) else 2,
     )

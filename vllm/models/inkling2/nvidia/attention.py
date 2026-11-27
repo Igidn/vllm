@@ -291,9 +291,9 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         vllm_config = get_current_vllm_config()
         self.max_decode_query_len = max_decode_query_len(vllm_config)
         cache_dtype = vllm_config.cache_config.cache_dtype
-        supported: tuple[str, ...] = ("auto", "bfloat16")
+        supported: tuple[str, ...] = ("auto", "bfloat16", "float16")
         if current_platform.is_device_capability_family(120):
-            supported += ("float16", "fp8", "fp8_e4m3")
+            supported += ("fp8", "fp8_e4m3")
         if cache_dtype not in supported:
             raise ValueError(f"Inkling2 KV cache dtype must be one of {supported}")
         self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3")

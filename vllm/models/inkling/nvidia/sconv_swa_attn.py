@@ -173,9 +173,8 @@ class InklingConvState(nn.Module, AttentionLayerBase):
         )
         vllm_config = get_current_vllm_config()
         self._dtype = vllm_config.model_config.dtype
-        assert self._dtype == torch.bfloat16, (
-            f"sconv SWA cache supports bfloat16 only, got {self._dtype}"
-        )
+        if self._dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError(f"sconv SWA cache supports bf16/fp16, got {self._dtype}")
         # Register in the forward context so the runner enumerates this owner as
         # an attention-like layer (get_kv_cache_config / get_attn_backend).
         compilation_config = vllm_config.compilation_config

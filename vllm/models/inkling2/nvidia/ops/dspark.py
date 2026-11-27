@@ -93,7 +93,7 @@ def _qk_norm_rope_kernel(
     row = X + t * row_stride + col0
     if NORM:
         w_ptr = tl.where(is_q, Q_WEIGHT.to(tl.int64), K_WEIGHT.to(tl.int64)).to(
-            tl.pointer_type(tl.bfloat16)
+            Q_WEIGHT.dtype
         )
         x = tl.load(row + d_ar).to(tl.float32)
         ms = tl.sum(x * x, 0) / D

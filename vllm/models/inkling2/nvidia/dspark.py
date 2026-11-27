@@ -28,6 +28,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
@@ -79,7 +80,13 @@ def all_reduce_add_rmsnorm(
     bf16 residual. Others all-reduce, then add and normalize.
     """
     fi_ar = getattr(get_tp_group().device_communicator, "fi_ar_comm", None)
-    if fi_ar is None or not fi_ar.should_use_fi_ar(x):
+    capability = current_platform.get_device_capability()
+    if (
+        fi_ar is None
+        or not fi_ar.should_use_fi_ar(x)
+        or capability is None
+        or capability[0] < 9
+    ):
         return norm(tensor_model_parallel_all_reduce(x), residual)
     from vllm.compilation.passes.fusion.allreduce_rms_fusion import (
         flashinfer_comm,
@@ -99,7 +106,7 @@ def all_reduce_add_rmsnorm(
     )
     assert flashinfer_comm is not None and workspace is not None
     assert workspace.backend == "mnnvl"
-    assert x.dtype == residual.dtype == norm.weight.dtype == torch.bfloat16
+    assert x.dtype == residual.dtype == norm.weight.dtype
     assert x.shape == residual.shape and residual.is_contiguous()
     flashinfer_trtllm_fused_allreduce_norm(
         allreduce_in=x,
@@ -487,7 +494,10 @@ class Inkling2DSparkModel(nn.Module):
         """Finish sharing the target's normalized embeddings and LM head (its
         `embed_tokens` and `lm_head` are aliased by `load_dspark_model`)
         and derive the weights that depend on them."""
-        assert self.lm_head is not None and self.lm_head.weight.dtype == torch.bfloat16
+        assert self.lm_head is not None and self.lm_head.weight.dtype in (
+            torch.bfloat16,
+            torch.float16,
+        )
         self.model.embed_norm = target_model.model.embed_norm
         head = self.model.markov_head
         head.rnn_bias = torch.empty_like(head.rnn_proj.bias, dtype=torch.float32)
@@ -580,7 +590,8 @@ class Inkling2DSparkModel(nn.Module):
                     break
             param = params[name]
             if weight.dtype != param.dtype:
-                raise ValueError(f"{name}: expected {param.dtype}, got {weight.dtype}")
+                # Checkpoints are bf16; with --dtype half the params are fp16.
+                param.data.copy_(weight)
             if shard is None:
                 getattr(param, "weight_loader", default_weight_loader)(param, weight)
             else:

@@ -297,10 +297,11 @@ class Inkling2DSparkConfig(PreTrainedConfig):
             or draft.get("o_bias")
         ):
             raise ValueError("Unsupported Inkling2 mtp_config")
+        target_dtype = getattr(config, "dtype", None) or "bfloat16"
         return cls(
             **draft,
             vocab_size=text.vocab_size,
             padded_vocab_size=text.padded_vocab_size,
             final_logit_softcapping=text.final_logit_softcapping,
-            torch_dtype="bfloat16",
+            torch_dtype=str(target_dtype).removeprefix("torch."),
         )

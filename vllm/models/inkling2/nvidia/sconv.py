@@ -268,7 +268,7 @@ class Inkling2ShortConv(nn.Module):
         )
         cache = torch.empty(
             (1, owner.num_kv_heads, owner.block_size, owner.head_size),
-            dtype=torch.bfloat16,
+            dtype=owner._dtype,
             device=positions.device,
         )
         return metadata, cache, owner.block_size

@@ -36,11 +36,11 @@ def conv_mix(
     halo: int = 0,
     prefix_align: int = 0,
 ) -> torch.Tensor:
-    """`short_conv` the reduced bf16 `x` into `conv_out` (with the
+    """`short_conv` the reduced `x` into `conv_out` (with the
     optional `(residual + addend) + y` update), then `attn_res` over
     `[*stack, (last +) conv_out]` with each query. Returns the `(Q, T, D)`
-    bf16 mix outputs, or without `norm_weight` the fp32 mixes before the
-    RMSNorm (not with `sp`).
+    model-dtype mix outputs, or without `norm_weight` the fp32 mixes before
+    the RMSNorm (not with `sp`).
 
     With `sp`, the tokens are this rank's shard of the batch, `x` starts
     with the `halo` rows before it (or is `(world, halo + T, D)`, the
@@ -54,7 +54,7 @@ def conv_mix(
     assert num_tokens > 0 and conv_out.is_contiguous()
     assert x.shape[-2:] == (halo + num_tokens, d)
     assert x.stride(-1) == 1 and x.stride(-2) == d
-    assert x.dtype == torch.bfloat16
+    assert x.dtype == conv_out.dtype
     for t in (residual, addend, last):
         assert t is None or (t.is_contiguous() and t.shape == conv_out.shape)
     assert residual is None or addend is not None

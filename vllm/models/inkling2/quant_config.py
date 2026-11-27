@@ -39,11 +39,11 @@ class Inkling2QuantConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
-        return [torch.bfloat16]
+        return [torch.bfloat16, torch.float16]
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 80
+        return 75
 
     @staticmethod
     def get_config_filenames() -> list[str]:

@@ -792,9 +792,9 @@ class Inkling2ForConditionalGeneration(
                         "Inkling2 experts are NVFP4 / MXFP8, as declared per "
                         "tensor in the checkpoint's hf_quant_config.json"
                     )
-                raise ValueError(
-                    f"{name}: checkpoint dtype {weight.dtype} != {param.dtype}"
-                )
+                # Checkpoints are bf16; with --dtype half the params are fp16.
+                # Expert weights stay packed and keep their checkpoint dtype.
+                param.data.copy_(weight)
             loader: Callable[..., None] = getattr(
                 param, "weight_loader", default_weight_loader
             )

@@ -114,7 +114,7 @@ def all_reduce_add_rmsnorm(
         rms_gamma=norm.weight,
         rms_eps=norm.eps,
         world_size=fi_ar.world_size,
-        launch_with_pdl=True,
+        launch_with_pdl=current_platform.is_arch_support_pdl(),
         fp32_acc=True,
         max_token_num=fi_ar.max_num_tokens,
         pattern_code=flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,

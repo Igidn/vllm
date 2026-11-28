@@ -4,8 +4,9 @@
 
 Rows are tokens of the packed images (a CLS row, then the native patches in
 row-major order). Row metadata is int32 `[T, 4]`: native `(y, x)` and the
-native grid `(height, width)`, with `y = x = -1` on CLS rows. Outputs are
-rounded to bf16 at the same points as the eager PyTorch ops they replace.
+native grid `(height, width)`, with `y = x = -1` on CLS rows. Values are
+rounded to bf16 at the same points as the eager PyTorch ops they replace, and
+stored in the tensor's dtype (fp16 on Turing, which has no bf16 PTX).
 """
 
 import functools
@@ -24,16 +25,13 @@ def _rope_inv_freq(head_dim: int, device: torch.device) -> torch.Tensor:
 
 @triton.jit
 def _bf16(x):
-    # Round to bf16 and back; inline asm keeps Triton from folding the casts.
-    rounded = tl.inline_asm_elementwise(
-        "cvt.rn.bf16.f32 $0, $1;",
-        "=h,f",
-        [x],
-        dtype=tl.bfloat16,
-        is_pure=True,
-        pack=1,
-    )
-    return rounded.to(tl.float32)
+    # fp32 -> bf16 -> fp32 (round to nearest even) on the bits: `cvt.rn.bf16.f32`
+    # is illegal on sm75, and the compiler folds an extf(truncf(x)) pair, which
+    # would fuse the surrounding mul + add into an FMA. Same helper as the
+    # DSpark draft (`ops/dspark.py`).
+    bits = x.to(tl.uint32, bitcast=True)
+    bits = (bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000
+    return bits.to(tl.float32, bitcast=True)
 
 
 @triton.jit
@@ -95,8 +93,8 @@ def gather_patches(
     clip_std: tuple[float, float, float],
     std: tuple[float, float, float],
 ) -> torch.Tensor:
-    """Native patches of raw `[N, side, side, 3]` pixels as bf16 rows of
-    `(py, px, c)` values in [-1, 1].
+    """Native patches of raw `[N, side, side, 3]` pixels as rows of
+    `(py, px, c)` values in [-1, 1], in the pixels' dtype.
 
     Each value is `2 * (bf16((v / 255 - mean) / clip_std) * std + mean) - 1`.
     `offsets[i]` is the element offset of row i's top-left pixel.

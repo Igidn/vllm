@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.models.inkling2.nvidia.ops import use_sm100_kernels
 from vllm.models.inkling2.nvidia.ops.linear import linear_k_groups
@@ -43,11 +44,16 @@ class _SM120Linear(nn.Linear):
         return out.to(x.dtype)
 
 
-def _linear(in_features: int, out_features: int, bias: bool = True) -> nn.Linear:
+def _linear(
+    in_features: int,
+    out_features: int,
+    bias: bool = True,
+    dtype: torch.dtype = torch.bfloat16,
+) -> nn.Linear:
     cls = (
         _SM120Linear if current_platform.is_device_capability_family(120) else nn.Linear
     )
-    return cls(in_features, out_features, bias=bias, dtype=torch.bfloat16)
+    return cls(in_features, out_features, bias=bias, dtype=dtype)
 
 
 class VisionMetadata(NamedTuple):
@@ -64,12 +70,14 @@ class VisionMetadata(NamedTuple):
 
 
 class Inkling2VisionAttention(nn.Module):
-    def __init__(self, width: int, num_heads: int) -> None:
+    def __init__(
+        self, width: int, num_heads: int, dtype: torch.dtype = torch.bfloat16
+    ) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = width // num_heads
-        self.qkv_proj = _linear(width, 3 * width)
-        self.out_proj = _linear(width, width)
+        self.qkv_proj = _linear(width, 3 * width, dtype=dtype)
+        self.out_proj = _linear(width, width, dtype=dtype)
 
     def forward(self, hidden: torch.Tensor, metadata: VisionMetadata) -> torch.Tensor:
         qkv = self.qkv_proj(hidden)
@@ -97,31 +105,40 @@ class Inkling2VisionAttention(nn.Module):
 
 
 class Inkling2VisionMLP(nn.Module):
-    def __init__(self, width: int, intermediate_size: int) -> None:
+    def __init__(
+        self,
+        width: int,
+        intermediate_size: int,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
         super().__init__()
-        self.c_fc = _linear(width, intermediate_size)
-        self.c_proj = _linear(intermediate_size, width)
+        self.c_fc = _linear(width, intermediate_size, dtype=dtype)
+        self.c_proj = _linear(intermediate_size, width, dtype=dtype)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.c_proj(F.gelu(self.c_fc(hidden)))
 
 
 class Inkling2VisionLayerScale(nn.Module):
-    def __init__(self, width: int) -> None:
+    def __init__(self, width: int, dtype: torch.dtype = torch.bfloat16) -> None:
         super().__init__()
-        self.gamma = nn.Parameter(torch.empty(width, dtype=torch.bfloat16))
+        self.gamma = nn.Parameter(torch.empty(width, dtype=dtype))
 
 
 class Inkling2VisionLayer(nn.Module):
-    def __init__(self, config: Mapping[str, Any]) -> None:
+    def __init__(
+        self, config: Mapping[str, Any], dtype: torch.dtype = torch.bfloat16
+    ) -> None:
         super().__init__()
         width, eps = config["hidden_size"], config["layer_norm_eps"]
-        self.ln_1 = nn.LayerNorm(width, eps=eps, dtype=torch.bfloat16)
-        self.self_attn = Inkling2VisionAttention(width, config["num_attention_heads"])
-        self.ln_2 = nn.LayerNorm(width, eps=eps, dtype=torch.bfloat16)
-        self.mlp = Inkling2VisionMLP(width, int(width * config["mlp_ratio"]))
-        self.ls_1 = Inkling2VisionLayerScale(width)
-        self.ls_2 = Inkling2VisionLayerScale(width)
+        self.ln_1 = nn.LayerNorm(width, eps=eps, dtype=dtype)
+        self.self_attn = Inkling2VisionAttention(
+            width, config["num_attention_heads"], dtype
+        )
+        self.ln_2 = nn.LayerNorm(width, eps=eps, dtype=dtype)
+        self.mlp = Inkling2VisionMLP(width, int(width * config["mlp_ratio"]), dtype)
+        self.ls_1 = Inkling2VisionLayerScale(width, dtype)
+        self.ls_2 = Inkling2VisionLayerScale(width, dtype)
 
     def forward(
         self,
@@ -141,57 +158,79 @@ class Inkling2VisionLayer(nn.Module):
 
 
 class Inkling2VisionEmbeddings(nn.Module):
-    def __init__(self, config: Mapping[str, Any]) -> None:
+    def __init__(
+        self, config: Mapping[str, Any], dtype: torch.dtype = torch.bfloat16
+    ) -> None:
         super().__init__()
         width, grid = config["hidden_size"], config["posemb_grid_size"]
         self.patch_embedding = _linear(
-            3 * config["native_patch_size"] ** 2, width, bias=False
+            3 * config["native_patch_size"] ** 2, width, bias=False, dtype=dtype
         )
         self.position_embedding = nn.Parameter(
-            torch.empty(grid * grid, width, dtype=torch.bfloat16)
+            torch.empty(grid * grid, width, dtype=dtype)
         )
-        self.class_embedding = nn.Parameter(torch.empty(width, dtype=torch.bfloat16))
-        self.cls_position_embedding = nn.Parameter(
-            torch.empty(width, dtype=torch.bfloat16)
-        )
+        self.class_embedding = nn.Parameter(torch.empty(width, dtype=dtype))
+        self.cls_position_embedding = nn.Parameter(torch.empty(width, dtype=dtype))
 
 
 class Inkling2VisionBackbone(nn.Module):
-    def __init__(self, config: Mapping[str, Any]) -> None:
+    def __init__(
+        self, config: Mapping[str, Any], dtype: torch.dtype = torch.bfloat16
+    ) -> None:
         super().__init__()
-        self.embeddings = Inkling2VisionEmbeddings(config)
+        self.embeddings = Inkling2VisionEmbeddings(config, dtype)
         self.ln_pre = nn.LayerNorm(
-            config["hidden_size"], eps=config["layer_norm_eps"], dtype=torch.bfloat16
+            config["hidden_size"], eps=config["layer_norm_eps"], dtype=dtype
         )
         self.layers = nn.ModuleList(
-            Inkling2VisionLayer(config) for _ in range(config["num_hidden_layers"])
+            Inkling2VisionLayer(config, dtype)
+            for _ in range(config["num_hidden_layers"])
         )
 
 
 class Inkling2VisionEncoder(nn.Module):
-    """Maps raw `[N, 40, 40, 3]` bf16 pixel patches (-1 = padding) to decoder
+    """Maps raw `[N, 40, 40, 3]` pixel patches (-1 = padding) to decoder
     embeddings: a ViT with a CLS token per image, then a 2x2 merge projection to
     `text_hidden_size`. Runs replicated on every TP rank. Images are stills,
     so the `temporal_patch_size` frames of a patch are equal and their mean is
     the frame itself.
+
+    Weights and activations follow the model dtype (bf16 by default, fp16 on
+    Turing, which has no bf16 tensor cores); the kernels keep the reference's
+    bf16 rounding of each step regardless.
     """
 
-    def __init__(self, config: Mapping[str, Any], text_hidden_size: int) -> None:
+    def __init__(
+        self,
+        config: Mapping[str, Any],
+        text_hidden_size: int,
+        dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
+        if dtype is None:
+            vllm_config = get_current_vllm_config_or_none()
+            dtype = (
+                vllm_config.model_config.dtype
+                if vllm_config is not None
+                else torch.bfloat16
+            )
+        self.dtype = dtype
         self.patch_size = config["native_patch_size"]
         self.merge_size = config["adapter_merge_size"]
         self.posemb_grid_size = config["posemb_grid_size"]
         self.text_hidden_size = text_hidden_size
-        self.backbone = Inkling2VisionBackbone(config)
+        self.backbone = Inkling2VisionBackbone(config, dtype)
         self.proj_in = _linear(
             self.merge_size**2 * config["hidden_size"],
             config["projection_hidden_dim"],
             bias=config["projector_bias"],
+            dtype=dtype,
         )
         self.proj_out = _linear(
             config["projection_hidden_dim"],
             text_hidden_size,
             bias=config["projector_bias"],
+            dtype=dtype,
         )
 
     def metadata(self, grid: list[list[int]], device: torch.device) -> VisionMetadata:
@@ -241,7 +280,9 @@ class Inkling2VisionEncoder(nn.Module):
 
     def forward(self, pixels: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
         side = self.patch_size * self.merge_size
-        assert pixels.dtype == torch.bfloat16
+        # The processor emits the reference bf16 pixels; cast once here so the
+        # encoder runs in the model dtype (fp16 on Turing).
+        pixels = pixels.to(self.dtype)
         assert pixels.shape[1:] == (side, side, 3)
         grid = grid_thw.tolist()
         assert all(t == 1 for t, _, _ in grid)

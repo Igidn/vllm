@@ -19,9 +19,13 @@ from vllm.models.inkling2.nvidia.vision import (
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0] not in (9, 10, 12),
-    reason="needs a Hopper or Blackwell GPU",
+    or torch.cuda.get_device_capability()[0] not in (9, 10, 12, 75),
+    reason="needs a Hopper, Blackwell or Turing GPU",
 )
+
+# The encoder follows the model dtype: bf16 by default, fp16 on Turing (sm75),
+# which has neither bf16 tensor cores nor bf16 PTX.
+DTYPES = [torch.bfloat16, torch.float16]
 
 CONFIG = {
     "temporal_patch_size": 2,
@@ -38,7 +42,7 @@ CONFIG = {
 }
 
 
-def _rope(x, positions):
+def _rope(x, positions, dtype):
     dim = x.shape[-1]
     inv_freq = 10000.0 ** (-torch.arange(0, dim, 4, device=x.device) / dim)
     angles = torch.cat((positions[:, 1:] * inv_freq, positions[:, :1] * inv_freq), -1)[
@@ -49,10 +53,10 @@ def _rope(x, positions):
         even * angles.cos() - odd * angles.sin(),
         even * angles.sin() + odd * angles.cos(),
     )
-    return torch.stack(rotated, -1).flatten(-2).bfloat16()
+    return torch.stack(rotated, -1).flatten(-2).to(dtype)
 
 
-def _normalize(raw: torch.Tensor) -> torch.Tensor:
+def _normalize(raw: torch.Tensor, dtype) -> torch.Tensor:
     """The former CPU CLIP normalization, then the encoder's PE remap."""
     mean = np.array(_CLIP_MEAN, np.float32)
     clip = (raw.float().cpu().numpy() / np.float32(255) - mean) / np.array(
@@ -60,7 +64,7 @@ def _normalize(raw: torch.Tensor) -> torch.Tensor:
     )
     x = torch.from_numpy(clip).bfloat16().float().to(raw.device)
     x = x * torch.tensor(_CLIP_STD, device=raw.device)
-    return (2.0 * (x + torch.tensor(_CLIP_MEAN, device=raw.device)) - 1.0).bfloat16()
+    return (2.0 * (x + torch.tensor(_CLIP_MEAN, device=raw.device)) - 1.0).to(dtype)
 
 
 def _reference_image(enc, raw, h, w):
@@ -72,7 +76,7 @@ def _reference_image(enc, raw, h, w):
     hidden = emb.patch_embedding(pixels.reshape(height * wide, -1))
     grid = emb.position_embedding.view(1, 32, 32, width).permute(0, 3, 1, 2)
     pos = F.interpolate(grid.float(), (height, wide), mode="bilinear")
-    hidden = hidden + pos[0].permute(1, 2, 0).reshape(-1, width).bfloat16()
+    hidden = hidden + pos[0].permute(1, 2, 0).reshape(-1, width).to(enc.dtype)
     cls = (emb.class_embedding + emb.cls_position_embedding)[None]
     hidden = enc.backbone.ln_pre(torch.cat((cls, hidden)))
     y, x_ = torch.meshgrid(
@@ -93,7 +97,7 @@ def _reference_image(enc, raw, h, w):
             .view(-1, 3, attn.num_heads, attn.head_dim)
             .unbind(1)
         )
-        q, k = _rope(q, positions), _rope(k, positions)
+        q, k = _rope(q, positions, enc.dtype), _rope(k, positions, enc.dtype)
         out = F.scaled_dot_product_attention(
             *(t.transpose(0, 1) for t in (q, k, v))
         ).transpose(0, 1)
@@ -105,12 +109,13 @@ def _reference_image(enc, raw, h, w):
     return enc.proj_out(F.gelu(enc.proj_in(pooled)))
 
 
+@pytest.mark.parametrize("dtype", DTYPES)
 @torch.inference_mode()
-def test_packed_images_match_per_image_reference():
+def test_packed_images_match_per_image_reference(dtype):
     """Packed multi-image metadata (positions, pixel gather, CLS rows, 2x2
     pooling) must match encoding each image on its own."""
     torch.manual_seed(0)
-    enc = Inkling2VisionEncoder(CONFIG, text_hidden_size=192).cuda()
+    enc = Inkling2VisionEncoder(CONFIG, text_hidden_size=192, dtype=dtype).cuda()
     for param in enc.parameters():
         param.data.normal_(0, 0.05)
     for name, param in enc.named_parameters():
@@ -118,7 +123,7 @@ def test_packed_images_match_per_image_reference():
             param.data.fill_(1.0)
     grids = [(3, 5), (7, 2), (1, 1)]
     patches = torch.randint(-1, 256, (sum(h * w for h, w in grids), 40, 40, 3))
-    patches = patches.cuda().bfloat16()
+    patches = patches.cuda().to(dtype)
     grid_thw = torch.tensor([(1, h, w) for h, w in grids])
 
     out = enc(patches, grid_thw)
@@ -132,29 +137,31 @@ def test_packed_images_match_per_image_reference():
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
-def test_gather_patches_matches_cpu_normalization():
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_gather_patches_matches_cpu_normalization(dtype):
     """Raw pixels (and -1 padding) normalize bitwise like the CPU processor's
     float32 CLIP step followed by the encoder's bf16 PE remap."""
     raw = torch.arange(-1, 256).repeat(75)[: 4 * 40 * 40 * 3]
-    raw = raw.reshape(4, 40, 40, 3).cuda().bfloat16()
+    raw = raw.reshape(4, 40, 40, 3).cuda().to(dtype)
     offsets = torch.tensor([0, 60, 20 * 120, 3 * 4800 + 20 * 120 + 60], device="cuda")
     out = gather_patches(
         raw, offsets.int(), 20, _CLIP_MEAN, _PROCESSOR_CLIP_STD, _CLIP_STD
     )
-    ref = _normalize(raw)
+    ref = _normalize(raw, dtype)
     expected = [ref[0, :20, :20], ref[0, :20, 20:], ref[0, 20:, :20], ref[3, 20:, 20:]]
     assert torch.equal(out, torch.stack(expected).reshape(4, -1))
 
 
+@pytest.mark.parametrize("dtype", DTYPES)
 @torch.inference_mode()
-def test_cuda_graph_replay_matches_eager():
+def test_cuda_graph_replay_matches_eager(dtype):
     """A graph captured on padded budget buffers (as EncoderCudaGraphManager
     pads them) replays smaller batches bitwise like the eager encoder."""
     from vllm.models.inkling2.nvidia.model import Inkling2ForConditionalGeneration as M
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
     torch.manual_seed(0)
-    enc = Inkling2VisionEncoder(CONFIG, text_hidden_size=192).cuda()
+    enc = Inkling2VisionEncoder(CONFIG, text_hidden_size=192, dtype=dtype).cuda()
     for param in enc.parameters():
         param.data.normal_(0, 0.05)
     model = SimpleNamespace(
@@ -165,7 +172,7 @@ def test_cuda_graph_replay_matches_eager():
     model._graph_values = MethodType(M._graph_values, model)
     config = M.get_encoder_cudagraph_config(model)
     buffers = M.prepare_encoder_cudagraph_capture_inputs(
-        model, 64, 4, 0, torch.device("cuda"), torch.bfloat16
+        model, 64, 4, 0, torch.device("cuda"), dtype
     ).values
     graph, out = torch.cuda.CUDAGraph(), None
     M.encoder_cudagraph_forward(model, dict(buffers))
@@ -175,7 +182,7 @@ def test_cuda_graph_replay_matches_eager():
     grids = [(3, 5), (2, 7)]
     pixels = torch.randint(-1, 256, (sum(h * w for h, w in grids), 40, 40, 3))
     mm_kwargs = {
-        "vision_pixels": pixels.cuda().bfloat16(),
+        "vision_pixels": pixels.cuda().to(dtype),
         "vision_grid_thw": torch.tensor([(1, h, w) for h, w in grids]),
     }
     replay = M.prepare_encoder_cudagraph_replay_buffers(model, mm_kwargs, 4, 0)

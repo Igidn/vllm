@@ -56,6 +56,30 @@ def _linear(
     return cls(in_features, out_features, bias=bias, dtype=dtype)
 
 
+def _masked_varlen_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens: torch.Tensor
+) -> torch.Tensor:
+    """Varlen attention over packed image rows, for GPUs without flash-attn.
+
+    Each image is its own sequence, so a block-diagonal mask over the packed
+    rows is exactly the varlen semantics. Built from device tensors only (no
+    host sync), so encoder CUDA-graph capture still works.
+    """
+    total = q.shape[0]
+    device = q.device
+    index = torch.arange(total, device=device)
+    segment = torch.searchsorted(cu_seqlens[1:].to(torch.int64), index, right=True)
+    mask = (segment[:, None] == segment[None, :])[None, None]
+    out = F.scaled_dot_product_attention(
+        q.transpose(0, 1).unsqueeze(0),
+        k.transpose(0, 1).unsqueeze(0),
+        v.transpose(0, 1).unsqueeze(0),
+        attn_mask=mask,
+        scale=q.shape[-1] ** -0.5,
+    )
+    return out.squeeze(0).transpose(0, 1)
+
+
 class VisionMetadata(NamedTuple):
     # int32 [T, 4] (y, x, height, width) in native patches; CLS: y = x = -1.
     meta: torch.Tensor
@@ -83,24 +107,57 @@ class Inkling2VisionAttention(nn.Module):
         qkv = self.qkv_proj(hidden)
         apply_rotary_qk_(qkv, metadata.meta, self.num_heads)
         q, k, v = qkv.view(-1, 3, self.num_heads, self.head_dim).unbind(1)
-        kwargs = dict(
-            cu_seqlens_q=metadata.cu_seqlens,
-            cu_seqlens_k=metadata.cu_seqlens,
-            max_seqlen_q=metadata.max_seqlen,
-            max_seqlen_k=metadata.max_seqlen,
-            softmax_scale=self.head_dim**-0.5,
-            causal=False,
-        )
         if use_sm100_kernels():
             # Built only for SM100 CUDA targets, so imported where it runs.
             from vllm.third_party.tml_fa4 import flash_attn_varlen_func as fa4
 
-            out, _ = fa4(q, k, v, **kwargs)
+            out, _ = fa4(
+                q,
+                k,
+                v,
+                cu_seqlens_q=metadata.cu_seqlens,
+                cu_seqlens_k=metadata.cu_seqlens,
+                max_seqlen_q=metadata.max_seqlen,
+                max_seqlen_k=metadata.max_seqlen,
+                softmax_scale=self.head_dim**-0.5,
+                causal=False,
+            )
+        elif current_platform.is_device_capability_family(90):
+            from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+            out = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                fa_version=3,
+                cu_seqlens_q=metadata.cu_seqlens,
+                cu_seqlens_k=metadata.cu_seqlens,
+                max_seqlen_q=metadata.max_seqlen,
+                max_seqlen_k=metadata.max_seqlen,
+                softmax_scale=self.head_dim**-0.5,
+                causal=False,
+            )
+        elif current_platform.is_device_capability(75):
+            # This flash-attn build is Ampere-only, and Turing has no bf16
+            # anyway. Images are independent sequences, so a block-diagonal
+            # mask over the packed rows is the varlen attention; it is built
+            # from device tensors only, so encoder graph capture still works.
+            out = _masked_varlen_attention(q, k, v, metadata.cu_seqlens)
         else:
             from vllm.vllm_flash_attn import flash_attn_varlen_func
 
-            version = 3 if current_platform.is_device_capability_family(90) else 2
-            out = flash_attn_varlen_func(q, k, v, fa_version=version, **kwargs)
+            out = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                fa_version=2,
+                cu_seqlens_q=metadata.cu_seqlens,
+                cu_seqlens_k=metadata.cu_seqlens,
+                max_seqlen_q=metadata.max_seqlen,
+                max_seqlen_k=metadata.max_seqlen,
+                softmax_scale=self.head_dim**-0.5,
+                causal=False,
+            )
         return self.out_proj(out.view(hidden.shape))
 
 

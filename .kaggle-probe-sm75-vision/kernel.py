@@ -37,7 +37,7 @@ RESULT_PATH = Path("/kaggle/working/probe-sm75-vision-result.json")
 
 FORK_URL = os.environ.get("KAGGLE_FORK_URL", "https://github.com/Igidn/vllm.git")
 FORK_REF = os.environ.get(
-    "KAGGLE_FORK_REF", "a57572da502e18f24809207856a1ea84a6f6124e"
+    "KAGGLE_FORK_REF", "05a41d94df40efa731a36d818c2358f95cc16b7d"
 )
 PRECOMPILED_COMMIT = os.environ.get(
     "KAGGLE_PRECOMPILED_COMMIT", "8c97cff059fc0d142cbc4acef9fbba62c0e08aed"
@@ -205,7 +205,7 @@ def serve_once(env) -> dict:
         "--max-num-batched-tokens",
         "512",
         "--gpu-memory-utilization",
-        "1.0",
+        "0.98",
         "--max-num-seqs",
         "8",
         # Vision on: the replicated encoder costs ~0.59 GiB per TP rank.

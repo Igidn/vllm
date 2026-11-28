@@ -606,6 +606,11 @@ class Inkling2ForConditionalGeneration(
         assert isinstance(patches, torch.Tensor)
         assert isinstance(grid_thw, torch.Tensor)
         assert self.visual is not None
+        if next(self.visual.parameters()).device.type == "cpu":
+            # Host-resident encoder: the Triton kernels are CUDA-only, so use
+            # the PyTorch path and hand the embeddings back to the GPU.
+            embeds = self.visual.encode_cpu(patches.cpu(), grid_thw.cpu())
+            return embeds.to(patches.device).split(grid_thw.prod(-1).tolist())
         embeds = self.visual(patches, grid_thw)
         return embeds.split(grid_thw.prod(-1).tolist())
 

@@ -56,6 +56,21 @@ def _linear(
     return cls(in_features, out_features, bias=bias, dtype=dtype)
 
 
+def _rope_cpu(x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    """Interleaved 2D RoPE, matching `_rotary_qk_kernel` (CPU fallback)."""
+    dim = x.shape[-1]
+    inv_freq = 10000.0 ** (-torch.arange(0, dim, 4, device=x.device) / dim)
+    angles = torch.cat(
+        (positions[:, 1:] * inv_freq, positions[:, :1] * inv_freq), -1
+    )[:, None]
+    even, odd = x.float()[..., 0::2], x.float()[..., 1::2]
+    rotated = (
+        even * angles.cos() - odd * angles.sin(),
+        even * angles.sin() + odd * angles.cos(),
+    )
+    return torch.stack(rotated, -1).flatten(-2).to(x.dtype)
+
+
 def _masked_varlen_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -290,19 +305,86 @@ class Inkling2VisionEncoder(nn.Module):
         self.merge_size = config["adapter_merge_size"]
         self.posemb_grid_size = config["posemb_grid_size"]
         self.text_hidden_size = text_hidden_size
-        self.backbone = Inkling2VisionBackbone(config, dtype)
-        self.proj_in = _linear(
-            self.merge_size**2 * config["hidden_size"],
-            config["projection_hidden_dim"],
-            bias=config["projector_bias"],
-            dtype=dtype,
-        )
-        self.proj_out = _linear(
-            config["projection_hidden_dim"],
-            text_hidden_size,
-            bias=config["projector_bias"],
-            dtype=dtype,
-        )
+        # The encoder is replicated per TP rank and its transient peak is ~1 GiB
+        # regardless of image size, which a 100k context needs. Keep the weights
+        # host-resident and run the (one-off) encode on the CPU; see
+        # `Inkling2ForConditionalGeneration.embed_multimodal`.
+        with torch.device("cpu"):
+            self.backbone = Inkling2VisionBackbone(config, dtype)
+            self.proj_in = _linear(
+                self.merge_size**2 * config["hidden_size"],
+                config["projection_hidden_dim"],
+                bias=config["projector_bias"],
+                dtype=dtype,
+            )
+            self.proj_out = _linear(
+                config["projection_hidden_dim"],
+                text_hidden_size,
+                bias=config["projector_bias"],
+                dtype=dtype,
+            )
+            # CPU fp16 linear is slow and often unimplemented; the one-off
+            # encode runs in fp32 (1.27 GB of host RAM for this checkpoint).
+            self.float()
+
+    def encode_cpu(
+        self, pixels: torch.Tensor, grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        """Pure-PyTorch encode for the CPU-resident encoder (no Triton).
+
+        Mirrors `encode`, which needs CUDA kernels. Runs in fp32: the weights
+        are 16-bit but CPU fp16 is slow and often unimplemented.
+        """
+        mean = torch.tensor(_CLIP_MEAN, dtype=torch.float32)
+        clip_std = torch.tensor(_PROCESSOR_CLIP_STD, dtype=torch.float32)
+        std = torch.tensor(_CLIP_STD, dtype=torch.float32)
+        x = pixels.to(torch.float32)
+        x = (x / 255.0 - mean) / clip_std
+        x = x.bfloat16().float()
+        x = 2.0 * (x * std + mean) - 1.0
+
+        m, width = self.merge_size, self.backbone.embeddings.position_embedding.shape[-1]
+        emb = self.backbone.embeddings
+        grid = emb.position_embedding.view(
+            1, self.posemb_grid_size, self.posemb_grid_size, width
+        ).permute(0, 3, 1, 2)
+        out, start = [], 0
+        for _, h, w in grid_thw.tolist():
+            n = h * w
+            img, start = x[start : start + n], start + n
+            height, wide = h * m, w * m
+            hidden = emb.patch_embedding(img.reshape(n, -1))
+            pos = F.interpolate(grid.float(), (height, wide), mode="bilinear")[0]
+            pos = pos.permute(1, 2, 0).reshape(height * wide, width).to(hidden.dtype)
+            cls = (emb.class_embedding + emb.cls_position_embedding)[None]
+            hidden = self.backbone.ln_pre(torch.cat((cls, hidden + pos)))
+            y, x_ = torch.meshgrid(
+                torch.arange(height), torch.arange(wide), indexing="ij"
+            )
+            positions = torch.cat(
+                (
+                    torch.zeros(1, 2),
+                    torch.stack((y.flatten(), x_.flatten()), -1) + 1,
+                )
+            )
+            for layer in self.backbone.layers:
+                attn = layer.self_attn
+                q, k, v = (
+                    attn.qkv_proj(layer.ln_1(hidden))
+                    .view(-1, 3, attn.num_heads, attn.head_dim)
+                    .unbind(1)
+                )
+                q, k = _rope_cpu(q, positions), _rope_cpu(k, positions)
+                part = F.scaled_dot_product_attention(
+                    *(t.transpose(0, 1).unsqueeze(0) for t in (q, k, v))
+                )
+                hidden = hidden + attn.out_proj(
+                    part.squeeze(0).transpose(0, 1).reshape(hidden.shape)
+                ) * layer.ls_1.gamma
+                hidden = hidden + layer.mlp(layer.ln_2(hidden)) * layer.ls_2.gamma
+            pooled = hidden[1:].reshape(h, m, w, m, width).permute(0, 2, 1, 3, 4)
+            out.append(self.proj_out(F.gelu(self.proj_in(pooled.reshape(h * w, -1)))))
+        return torch.cat(out, 0)
 
     def metadata(self, grid: list[list[int]], device: torch.device) -> VisionMetadata:
         m, p, side = self.merge_size, self.patch_size, self.merge_size * self.patch_size

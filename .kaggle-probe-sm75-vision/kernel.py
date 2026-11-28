@@ -37,7 +37,7 @@ RESULT_PATH = Path("/kaggle/working/probe-sm75-vision-result.json")
 
 FORK_URL = os.environ.get("KAGGLE_FORK_URL", "https://github.com/Igidn/vllm.git")
 FORK_REF = os.environ.get(
-    "KAGGLE_FORK_REF", "fabc027265fac4970ec52dd8a4f6530443222899"
+    "KAGGLE_FORK_REF", "a57572da502e18f24809207856a1ea84a6f6124e"
 )
 PRECOMPILED_COMMIT = os.environ.get(
     "KAGGLE_PRECOMPILED_COMMIT", "8c97cff059fc0d142cbc4acef9fbba62c0e08aed"
@@ -201,11 +201,11 @@ def serve_once(env) -> dict:
         "--dtype",
         "half",
         "--max-model-len",
-        "81920",
+        "102400",
         "--max-num-batched-tokens",
         "512",
         "--gpu-memory-utilization",
-        "0.98",
+        "1.0",
         "--max-num-seqs",
         "8",
         # Vision on: the replicated encoder costs ~0.59 GiB per TP rank.
@@ -354,15 +354,12 @@ def main():
         RESULT["pytest_tail"] = out[-6000:]
 
 
-        # Stage 2: a real server with vision enabled at 80k context.
+        # Stage 2: a real server with vision enabled at 100k context.
         env = {
             **os.environ,
             "VLLM_NO_USAGE_STATS": "1",
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
         }
-        # Stage 1b: the encoder's own peak, before the server takes the GPU.
-        RESULT["encoder_peak"] = encoder_peak()
-
         RESULT["serve"] = serve_once(env)
 
         log = LOG.read_text(errors="replace")

@@ -57,27 +57,40 @@ def _linear(
 
 
 def _masked_varlen_attention(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens: torch.Tensor
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk: int = 512,
 ) -> torch.Tensor:
     """Varlen attention over packed image rows, for GPUs without flash-attn.
 
     Each image is its own sequence, so a block-diagonal mask over the packed
     rows is exactly the varlen semantics. Built from device tensors only (no
     host sync), so encoder CUDA-graph capture still works.
+
+    Queries are processed in chunks: a mask forces SDPA's math backend, which
+    materializes `[heads, chunk, total]` scores, and one 2704-token profiling
+    image would otherwise need ~0.5 GiB of them.
     """
     total = q.shape[0]
     device = q.device
     index = torch.arange(total, device=device)
     segment = torch.searchsorted(cu_seqlens[1:].to(torch.int64), index, right=True)
-    mask = (segment[:, None] == segment[None, :])[None, None]
-    out = F.scaled_dot_product_attention(
-        q.transpose(0, 1).unsqueeze(0),
-        k.transpose(0, 1).unsqueeze(0),
-        v.transpose(0, 1).unsqueeze(0),
-        attn_mask=mask,
-        scale=q.shape[-1] ** -0.5,
-    )
-    return out.squeeze(0).transpose(0, 1)
+    keys = (k.transpose(0, 1).unsqueeze(0), v.transpose(0, 1).unsqueeze(0))
+    scale = q.shape[-1] ** -0.5
+    out = []
+    for start in range(0, total, chunk):
+        end = min(start + chunk, total)
+        mask = (segment[start:end, None] == segment[None, :])[None, None]
+        part = F.scaled_dot_product_attention(
+            q[start:end].transpose(0, 1).unsqueeze(0),
+            *keys,
+            attn_mask=mask,
+            scale=scale,
+        )
+        out.append(part.squeeze(0).transpose(0, 1))
+    return torch.cat(out, 0)
 
 
 class VisionMetadata(NamedTuple):

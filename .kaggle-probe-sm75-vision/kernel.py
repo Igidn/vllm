@@ -37,7 +37,7 @@ RESULT_PATH = Path("/kaggle/working/probe-sm75-vision-result.json")
 
 FORK_URL = os.environ.get("KAGGLE_FORK_URL", "https://github.com/Igidn/vllm.git")
 FORK_REF = os.environ.get(
-    "KAGGLE_FORK_REF", "44ca4db374e10e655a7023fed1341787cfe0b23d"
+    "KAGGLE_FORK_REF", "fbdd82cf337657953be0197eb5a4d00b1a2804fb"
 )
 PRECOMPILED_COMMIT = os.environ.get(
     "KAGGLE_PRECOMPILED_COMMIT", "8c97cff059fc0d142cbc4acef9fbba62c0e08aed"
@@ -54,7 +54,7 @@ RESULT: dict = {
 }
 
 
-def run(argv, timeout=1200, env=None):
+def run(argv, timeout=1200, env=None, cwd=None):
     cmd = " ".join(str(a) for a in argv)
     print("+", cmd, flush=True)
     p = subprocess.run(
@@ -63,6 +63,7 @@ def run(argv, timeout=1200, env=None):
         text=True,
         timeout=timeout,
         env=env or dict(os.environ),
+        cwd=cwd,
     )
     text = ((p.stdout or "") + (p.stderr or "")).strip()
     with RUN_LOG.open("a") as handle:
@@ -291,6 +292,8 @@ def main():
         # The slim venv has no test deps; pytest is all the vision tests need.
         run([uv, "pip", "install", "--python", str(PY), "pytest"], timeout=900)
 
+        # The slim venv has no test deps; pytest is all the vision tests need.
+        run([uv, "pip", "install", "--python", str(PY), "pytest"], timeout=900)
         # Stage 1: the fork's vision tests on the actual T4.
         code, out = run(
             [
@@ -302,6 +305,7 @@ def main():
                 "-q",
             ],
             timeout=2400,
+            cwd=SRC,
         )
         RESULT["pytest_code"] = code
         RESULT["pytest_tail"] = out[-6000:]

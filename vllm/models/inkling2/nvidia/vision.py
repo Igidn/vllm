@@ -279,10 +279,11 @@ class Inkling2VisionEncoder(nn.Module):
         super().__init__()
         if dtype is None:
             vllm_config = get_current_vllm_config_or_none()
+            model_config = (
+                vllm_config.model_config if vllm_config is not None else None
+            )
             dtype = (
-                vllm_config.model_config.dtype
-                if vllm_config is not None
-                else torch.bfloat16
+                model_config.dtype if model_config is not None else torch.bfloat16
             )
         self.dtype = dtype
         self.patch_size = config["native_patch_size"]

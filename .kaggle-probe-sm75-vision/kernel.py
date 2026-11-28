@@ -37,7 +37,7 @@ RESULT_PATH = Path("/kaggle/working/probe-sm75-vision-result.json")
 
 FORK_URL = os.environ.get("KAGGLE_FORK_URL", "https://github.com/Igidn/vllm.git")
 FORK_REF = os.environ.get(
-    "KAGGLE_FORK_REF", "fbdd82cf337657953be0197eb5a4d00b1a2804fb"
+    "KAGGLE_FORK_REF", "722144976eaf389eb8933c4bd24926bb151b85b5"
 )
 PRECOMPILED_COMMIT = os.environ.get(
     "KAGGLE_PRECOMPILED_COMMIT", "8c97cff059fc0d142cbc4acef9fbba62c0e08aed"
@@ -162,6 +162,9 @@ def ask_vision(question: str, png: bytes, max_tokens: int = 96) -> dict:
             ],
             "max_tokens": max_tokens,
             "temperature": 0.0,
+            # The default effort (0.9) spends the whole budget on reasoning and
+            # emits no content; the colour answer needs a low effort.
+            "chat_template_kwargs": {"reasoning_effort": 0.0},
         }
     ).encode()
     started = time.time()
@@ -203,7 +206,7 @@ def serve_once(env) -> dict:
         "--dtype",
         "half",
         "--max-model-len",
-        "102400",
+        "81920",
         "--max-num-batched-tokens",
         "512",
         "--gpu-memory-utilization",
@@ -289,11 +292,25 @@ def main():
 
         clone_fork()
         install_fork(uv)
-        # The slim venv has no test deps; pytest is all the vision tests need.
-        run([uv, "pip", "install", "--python", str(PY), "pytest"], timeout=900)
-
-        # The slim venv has no test deps; pytest is all the vision tests need.
-        run([uv, "pip", "install", "--python", str(PY), "pytest"], timeout=900)
+        # The slim venv has no test deps; install what tests/conftest.py and
+        # the vision tests need rather than the full test requirement set.
+        run(
+            [
+                uv,
+                "pip",
+                "install",
+                "--python",
+                str(PY),
+                "pytest",
+                "tblib",
+                "pytest-timeout",
+                "pytest-asyncio",
+                "pytest-forked",
+                "pytest-shard",
+                "pytest-rerunfailures",
+            ],
+            timeout=1200,
+        )
         # Stage 1: the fork's vision tests on the actual T4.
         code, out = run(
             [
@@ -310,7 +327,7 @@ def main():
         RESULT["pytest_code"] = code
         RESULT["pytest_tail"] = out[-6000:]
 
-        # Stage 2: a real server with vision enabled at 100k context.
+        # Stage 2: a real server with vision enabled at 80k context.
         env = {
             **os.environ,
             "VLLM_NO_USAGE_STATS": "1",

@@ -347,7 +347,7 @@ def test_dspark_rmsnorm_selects_fallback_on_sm75(monkeypatch):
     assert used == ["rmsnorm", "fused_add"]
 
 
-def test_vision_encoder_follows_model_dtype(default_vllm_config):
+def test_vision_encoder_follows_model_dtype():
     """The vision encoder is replicated per TP rank and must not force bf16:
     Turing has no bf16 tensor cores, so `--dtype half` has to reach it too."""
     from vllm.models.inkling2.nvidia.vision import Inkling2VisionEncoder
@@ -365,8 +365,8 @@ def test_vision_encoder_follows_model_dtype(default_vllm_config):
         "posemb_grid_size": 32,
         "layer_norm_eps": 1e-5,
     }
-    # Inside a vLLM config the dtype comes from the model; outside it (tests,
-    # standalone use) the reference bf16 default is kept.
+    # Outside a vLLM config (tests, standalone use) the reference bf16 default
+    # is kept; the serving path passes the model dtype explicitly.
     enc = Inkling2VisionEncoder(config, text_hidden_size=192)
     assert all(p.dtype == torch.bfloat16 for p in enc.parameters())
 

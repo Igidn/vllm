@@ -344,6 +344,7 @@ class Inkling2VisionEncoder(nn.Module):
         x = 2.0 * (x * std + mean) - 1.0
 
         m, width = self.merge_size, self.backbone.embeddings.position_embedding.shape[-1]
+        p = self.patch_size
         emb = self.backbone.embeddings
         grid = emb.position_embedding.view(
             1, self.posemb_grid_size, self.posemb_grid_size, width
@@ -353,7 +354,10 @@ class Inkling2VisionEncoder(nn.Module):
             n = h * w
             img, start = x[start : start + n], start + n
             height, wide = h * m, w * m
-            hidden = emb.patch_embedding(img.reshape(n, -1))
+            # One native p x p patch per merged cell, at the cell's sub-position
+            # (the Triton `gather_patches` extracts the same way).
+            cells = img.reshape(h, w, m, p, m, p, 3).permute(0, 2, 1, 4, 3, 5, 6)
+            hidden = emb.patch_embedding(cells.reshape(height * wide, -1))
             pos = F.interpolate(grid.float(), (height, wide), mode="bilinear")[0]
             pos = pos.permute(1, 2, 0).reshape(height * wide, width).to(hidden.dtype)
             cls = (emb.class_embedding + emb.cls_position_embedding)[None]

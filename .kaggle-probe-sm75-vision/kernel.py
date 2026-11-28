@@ -37,7 +37,7 @@ RESULT_PATH = Path("/kaggle/working/probe-sm75-vision-result.json")
 
 FORK_URL = os.environ.get("KAGGLE_FORK_URL", "https://github.com/Igidn/vllm.git")
 FORK_REF = os.environ.get(
-    "KAGGLE_FORK_REF", "722144976eaf389eb8933c4bd24926bb151b85b5"
+    "KAGGLE_FORK_REF", "fabc027265fac4970ec52dd8a4f6530443222899"
 )
 PRECOMPILED_COMMIT = os.environ.get(
     "KAGGLE_PRECOMPILED_COMMIT", "8c97cff059fc0d142cbc4acef9fbba62c0e08aed"
@@ -129,15 +129,10 @@ def install_fork(uv):
 
 
 def make_image(color: tuple[int, int, int], size: int = 256) -> bytes:
-    """A flat colour with a white bar, so 'what colour' has a real answer."""
-    from PIL import Image, ImageDraw
+    """A solid colour, so 'what colour' has exactly one right answer."""
+    from PIL import Image
 
     image = Image.new("RGB", (size, size), color)
-    draw = ImageDraw.Draw(image)
-    draw.rectangle(
-        [size // 4, size // 4, 3 * size // 4, 3 * size // 4],
-        fill=(255, 255, 255),
-    )
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return buffer.getvalue()
@@ -258,8 +253,8 @@ def serve_once(env) -> dict:
                 "exit_code": proc.poll(),
             }
             if ready:
-                out["red"] = ask_vision("What colour is the square? One word.", make_image((200, 30, 30)))
-                out["blue"] = ask_vision("What colour is the square? One word.", make_image((30, 30, 200)))
+                out["red"] = ask_vision("What colour is this image? One word.", make_image((200, 30, 30)))
+                out["blue"] = ask_vision("What colour is this image? One word.", make_image((30, 30, 200)))
                 out["text_only"] = ask_vision(
                     "Reply with one word: ok", make_image((30, 200, 30), size=64), max_tokens=32
                 )
@@ -270,6 +265,37 @@ def serve_once(env) -> dict:
             except subprocess.TimeoutExpired:
                 proc.kill()
     return out
+
+
+ENCODER_PEAK_SCRIPT = r"""
+import json, math, torch
+from vllm.models.inkling2.nvidia.vision import Inkling2VisionEncoder
+
+from huggingface_hub import hf_hub_download
+path = hf_hub_download("thinkingmachines/Inkling-2-Mini", "config.json")
+cfg = json.load(open(path))["vision_config"]
+enc = Inkling2VisionEncoder(cfg, text_hidden_size=2304, dtype=torch.float16).cuda()
+for p in enc.parameters():
+    p.data.normal_(0, 0.05)
+side = enc.patch_size
+for n in (676, 2704):
+    g = math.isqrt(n)
+    pixels = torch.randint(-1, 256, (n, side, side, 3)).cuda().to(torch.float16)
+    meta = enc.metadata([[1, g, g]], pixels.device)
+    torch.cuda.synchronize()
+    before = torch.cuda.max_memory_allocated()
+    with torch.inference_mode():
+        out = enc.encode(pixels, meta)
+    torch.cuda.synchronize()
+    peak = (torch.cuda.max_memory_allocated() - before) / 2**30
+    print(f"tokens={n} out={tuple(out.shape)} peak={peak:.3f} GiB")
+"""
+
+
+def encoder_peak() -> dict:
+    """The encoder's own peak allocation for a max-size profiling image."""
+    code, out = run([str(PY), "-c", ENCODER_PEAK_SCRIPT], timeout=1200)
+    return {"code": code, "out": out[-3000:]}
 
 
 def main():
@@ -319,7 +345,7 @@ def main():
                 "pytest",
                 "tests/models/inkling2/test_vision.py",
                 "tests/models/inkling2/test_sm75_fork.py",
-                "-q",
+                "-v",
             ],
             timeout=2400,
             cwd=SRC,
@@ -327,12 +353,16 @@ def main():
         RESULT["pytest_code"] = code
         RESULT["pytest_tail"] = out[-6000:]
 
+
         # Stage 2: a real server with vision enabled at 80k context.
         env = {
             **os.environ,
             "VLLM_NO_USAGE_STATS": "1",
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
         }
+        # Stage 1b: the encoder's own peak, before the server takes the GPU.
+        RESULT["encoder_peak"] = encoder_peak()
+
         RESULT["serve"] = serve_once(env)
 
         log = LOG.read_text(errors="replace")

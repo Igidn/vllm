@@ -46,8 +46,13 @@ IMAGE_PLACEHOLDER = "<|content_image|>"
 IMAGE_PAD_ID = 200054
 
 PATCH_SIZE = 40
-# Dummy (profiling) images are at most this many pixels per side.
-MAX_DUMMY_IMAGE_SIDE = 2048
+# Dummy (profiling) images are at most this many pixels per side. The encoder
+# is replicated per TP rank and its transient peak scales with the token count,
+# so a 2048px dummy (2704 tokens) reserved ~1 GiB that a 100k context needs.
+MAX_DUMMY_IMAGE_SIDE = 1024
+# Real images are downscaled to this side, so the profiled bound is a hard
+# bound: an image can never allocate more than the warmup reserved.
+MAX_IMAGE_SIDE = 1024
 
 ImageInput: TypeAlias = bytes | Image.Image | MediaWithBytes | np.ndarray
 
@@ -89,6 +94,16 @@ def decode_image(image: ImageInput) -> np.ndarray:
     return _pil_to_rgb(image)
 
 
+def _downscale(pixels: np.ndarray, max_side: int) -> np.ndarray:
+    """Shrink an image so its 40px grid never exceeds the profiled bound."""
+    height, width, _ = pixels.shape
+    if max(height, width) <= max_side:
+        return pixels
+    scale = max_side / max(height, width)
+    size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    return np.array(Image.fromarray(pixels).resize(size, Image.BILINEAR))
+
+
 class Inkling2ImageProcessor:
     """Pads each image to a 40-pixel grid and emits one patch per cell.
 
@@ -102,7 +117,9 @@ class Inkling2ImageProcessor:
         return math.ceil(height / PATCH_SIZE), math.ceil(width / PATCH_SIZE)
 
     def preprocess(self, images: Sequence[ImageInput]) -> dict[str, torch.Tensor]:
-        decoded = [torch.from_numpy(decode_image(image)) for image in images]
+        decoded = [decode_image(image) for image in images]
+        decoded = [_downscale(pixels, MAX_IMAGE_SIDE) for pixels in decoded]
+        decoded = [torch.from_numpy(pixels) for pixels in decoded]
         grids = [self.get_grid(pixels.shape[1], pixels.shape[0]) for pixels in decoded]
         out = torch.empty(
             (sum(rows * cols for rows, cols in grids), PATCH_SIZE, PATCH_SIZE, 3),
